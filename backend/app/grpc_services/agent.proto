@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package scopepilot;
+
+service AgentService {
+  rpc RunScope (ScopeRequest) returns (ScopeResponse);
+  rpc VerifyScope (VerifyRequest) returns (VerifyResponse);
+}
+
+message ScopeRequest {
+  string project_id = 1;
+  string requirements_json = 2;
+}
+
+message ScopeResponse {
+  string scope_json = 1;
+  string status = 2;
+}
+
+message VerifyRequest {
+  string project_id = 1;
+  string scope_json = 2;
+}
+
+message VerifyResponse {
+  bool verified = 1;
+  string feedback = 2;
+  string corrected_scope_json = 3;
+}
