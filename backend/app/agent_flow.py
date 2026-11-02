@@ -1,0 +1,199 @@
+"""
+Complete workflow orchestrator.
+All state transitions and the verifier correction loop live here.
+Only the two LLM agents (imported from agents.py) make model calls.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Optional
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agents import ScopeIntelligenceAgent, VerifierLoopAgent
+from app.database.models import (
+    AgentExecutionLog,
+    Project,
+    ProjectStatus,
+    Proposal,
+    ScopeVersion,
+    VerificationRun,
+)
+from app.database.schemas import (
+    ProjectEstimate,
+    ProjectScope,
+    StructuredRequirements,
+    VerificationResult,
+)
+from app.shell_agents.estimator import EstimationAgent
+from app.shell_agents.parser import ParserAgent
+from app.shell_agents.proposal_generator import ProposalGeneratorAgent
+from app.validation.rules import detect_repeated_failure, validate_scope_deterministically
+
+logger = logging.getLogger(__name__)
+
+
+class WorkflowBlockedError(Exception):
+    def __init__(self, reason: str, questions: Optional[list[str]] = None):
+        self.reason = reason
+        self.questions = questions or []
+        super().__init__(reason)
+
+
+class AgentFlow:
+    """Orchestrates the full ScopePilot pipeline for a single project."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+        self.parser = ParserAgent()
+        self.scope_agent = ScopeIntelligenceAgent()
+        self.verifier = VerifierLoopAgent()
+        self.estimator = EstimationAgent()
+        self.proposal_gen = ProposalGeneratorAgent()
+
+    async def run(self, project_id: UUID) -> dict[str, Any]:
+        project = await self._get_project(project_id)
+        if not project:
+            raise ValueError(f"Project {project_id} not found")
+
+        # 1. Parse
+        requirements = await self._parse(project)
+        if requirements.missing_info:
+            await self._update_status(project, ProjectStatus.NEEDS_CUSTOMER_INPUT)
+            raise WorkflowBlockedError(
+                "Missing information from customer",
+                questions=requirements.missing_info,
+            )
+
+        # 2. Scope
+        scope = await self._generate_scope(project, requirements)
+
+        # 3. Verify loop
+        verified_scope, verification = await self._verify_loop(project, scope)
+
+        # 4. Estimate
+        estimate = await self._estimate(project, verified_scope)
+
+        # 5. Proposal
+        proposal = await self._generate_proposal(project, verified_scope, estimate)
+
+        await self._update_status(project, ProjectStatus.PROPOSAL_READY)
+        return {
+            "project_id": str(project_id),
+            "status": project.status.value,
+            "scope": verified_scope.model_dump() if hasattr(verified_scope, "model_dump") else verified_scope,
+            "estimate": estimate.model_dump() if hasattr(estimate, "model_dump") else estimate,
+            "proposal_id": str(proposal.id) if proposal else None,
+        }
+
+    async def _get_project(self, project_id: UUID) -> Optional[Project]:
+        result = await self.session.execute(select(Project).where(Project.id == project_id))
+        return result.scalar_one_or_none()
+
+    async def _update_status(self, project: Project, status: ProjectStatus):
+        project.status = status
+        project.updated_at = datetime.now(timezone.utc)
+        await self.session.commit()
+
+    async def _parse(self, project: Project) -> StructuredRequirements:
+        start = time.time()
+        requirements = await self.parser.parse(project.original_prompt)
+        await self._log_execution(project.id, "parser", time.time() - start, "success")
+        return requirements
+
+    async def _generate_scope(
+        self, project: Project, requirements: StructuredRequirements
+    ) -> ProjectScope:
+        start = time.time()
+        scope = await self.scope_agent.generate(requirements)
+        version = ScopeVersion(
+            project_id=project.id,
+            version=1,
+            scope_json=scope.model_dump() if hasattr(scope, "model_dump") else scope,
+            created_by="scope_intelligence",
+        )
+        self.session.add(version)
+        await self.session.commit()
+        await self._log_execution(project.id, "scope_intelligence", time.time() - start, "success")
+        return scope
+
+    async def _verify_loop(
+        self, project: Project, scope: ProjectScope, max_iterations: int = 5
+    ) -> tuple[ProjectScope, VerificationResult]:
+        current = scope
+        history = []
+        for i in range(max_iterations):
+            start = time.time()
+            result = await self.verifier.verify(current)
+            history.append(result.model_dump() if hasattr(result, "model_dump") else result)
+
+            run = VerificationRun(
+                project_id=project.id,
+                iteration=i + 1,
+                verified=result.verified,
+                feedback=result.feedback,
+                result_json=result.model_dump() if hasattr(result, "model_dump") else result,
+            )
+            self.session.add(run)
+            await self.session.commit()
+            await self._log_execution(
+                project.id, "verifier", time.time() - start, "success" if result.verified else "needs_correction"
+            )
+
+            if result.verified:
+                return current, result
+
+            if detect_repeated_failure(history):
+                raise WorkflowBlockedError("Verifier failed repeatedly; human intervention required")
+
+            # Deterministic checks
+            det = validate_scope_deterministically(
+                current.model_dump() if hasattr(current, "model_dump") else current
+            )
+            if not det.get("ok", True):
+                logger.warning("Deterministic validation issues: %s", det)
+
+            # Correct
+            current = await self.scope_agent.correct(current, result.feedback)
+
+        raise WorkflowBlockedError("Max verification iterations exceeded")
+
+    async def _estimate(self, project: Project, scope: ProjectScope) -> ProjectEstimate:
+        start = time.time()
+        estimate = await self.estimator.estimate(scope)
+        await self._log_execution(project.id, "estimator", time.time() - start, "success")
+        return estimate
+
+    async def _generate_proposal(
+        self, project: Project, scope: ProjectScope, estimate: ProjectEstimate
+    ) -> Proposal:
+        start = time.time()
+        content = await self.proposal_gen.generate(project, scope, estimate)
+        proposal = Proposal(
+            project_id=project.id,
+            content=content,
+            status="draft",
+        )
+        self.session.add(proposal)
+        await self.session.commit()
+        await self.session.refresh(proposal)
+        await self._log_execution(project.id, "proposal_generator", time.time() - start, "success")
+        return proposal
+
+    async def _log_execution(
+        self, project_id: UUID, agent: str, duration: float, status: str
+    ):
+        log = AgentExecutionLog(
+            project_id=project_id,
+            agent_name=agent,
+            duration_seconds=duration,
+            status=status,
+        )
+        self.session.add(log)
+        await self.session.commit()
