@@ -1,6 +1,9 @@
 """
-The only two LLM-backed agents in the system.
-Scope Intelligence (Llama) and Verifier-Loop (Mistral) via OpenRouter.
+LLM-backed agents ONLY.
+Exactly two agents:
+  1. ScopeIntelligenceAgent  – Llama via OpenRouter
+  2. VerifierLoopAgent       – Mistral via OpenRouter
+No other LLM calls exist in the system.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ import logging
 from typing import Any
 
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 
 from app.config import get_settings
 from app.database.schemas import ProjectScope, StructuredRequirements, VerificationResult
@@ -34,8 +38,18 @@ class BaseLLMAgent:
                 {"role": "user", "content": user},
             ],
             temperature=temperature,
+            response_format={"type": "json_object"},
         )
-        return resp.choices[0].message.content or ""
+        return resp.choices[0].message.content or "{}"
+
+    def _extract_json(self, text: str) -> dict[str, Any]:
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(
+                lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+            )
+        return json.loads(text)
 
 
 class ScopeIntelligenceAgent(BaseLLMAgent):
@@ -48,35 +62,36 @@ class ScopeIntelligenceAgent(BaseLLMAgent):
         system = (
             "You are a senior project scoping expert. "
             "Convert structured requirements into a clear, complete project scope. "
-            "Return valid JSON matching the ProjectScope schema with fields: "
-            "summary, features (list of {name, description, priority}), "
-            "assumptions, constraints, out_of_scope, timeline_weeks."
+            "Return valid JSON with fields: summary (str), features (list of "
+            "{name, description, priority}), assumptions (list[str]), "
+            "constraints (list[str]), out_of_scope (list[str]), timeline_weeks (int|null)."
         )
         user = f"Requirements:\n{requirements.model_dump_json(indent=2)}"
         raw = await self._chat(system, user)
-        data = self._extract_json(raw)
-        return ProjectScope.model_validate(data)
+        try:
+            data = self._extract_json(raw)
+            return ProjectScope.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            logger.error("Scope agent returned invalid JSON: %s", raw[:500])
+            raise ValueError(f"ScopeIntelligenceAgent produced invalid output: {exc}") from exc
 
     async def correct(self, scope: ProjectScope, feedback: str) -> ProjectScope:
         system = (
             "You are a senior project scoping expert. "
             "Revise the given scope based on the verifier feedback. "
-            "Return the full corrected scope as valid JSON."
+            "Return the full corrected scope as valid JSON with the same schema."
         )
         user = (
             f"Current scope:\n{scope.model_dump_json(indent=2)}\n\n"
             f"Verifier feedback:\n{feedback}"
         )
         raw = await self._chat(system, user)
-        data = self._extract_json(raw)
-        return ProjectScope.model_validate(data)
-
-    def _extract_json(self, text: str) -> dict[str, Any]:
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-        return json.loads(text)
+        try:
+            data = self._extract_json(raw)
+            return ProjectScope.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            logger.error("Scope correct returned invalid JSON: %s", raw[:500])
+            raise ValueError(f"ScopeIntelligenceAgent.correct produced invalid output: {exc}") from e
 
 
 class VerifierLoopAgent(BaseLLMAgent):
@@ -94,12 +109,11 @@ class VerifierLoopAgent(BaseLLMAgent):
         )
         user = f"Scope to verify:\n{scope.model_dump_json(indent=2)}"
         raw = await self._chat(system, user, temperature=0.1)
-        data = self._extract_json(raw)
-        return VerificationResult.model_validate(data)
-
-    def _extract_json(self, text: str) -> dict[str, Any]:
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-        return json.loads(text)
+        try:
+            data = self._extract_json(raw)
+            if "issues" not in data:
+                data["issues"] = []
+            return VerificationResult.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            logger.error("Verifier agent returned invalid JSON: %s", raw[:500])
+            raise ValueError(f"VerifierLoopAgent produced invalid output: {exc}") from exc
